@@ -56,10 +56,13 @@ class MainActivity : ComponentActivity() {
     }
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun MainScreen() {
     val context = LocalContext.current
     var selectedModel by remember { mutableStateOf("mobilenet_v2.tflite") }
+    // "Interpreter" vs "CompiledModel"
+    var selectedRuntime by remember { mutableStateOf(ImageClassifier.Runtime.INTERPRETER) }
     
     var hasCameraPermission by remember {
         mutableStateOf(
@@ -90,24 +93,56 @@ fun MainScreen() {
                         Text("Camera", modifier = Modifier.padding(16.dp))
                     }
                 }
-                // Model Selector
-                Row(
+                // Model & Runtime Selector
+                Column(
                     modifier = Modifier.fillMaxWidth().padding(8.dp),
-                    horizontalArrangement = Arrangement.Center,
-                    verticalAlignment = Alignment.CenterVertically
+                    horizontalAlignment = Alignment.CenterHorizontally
                 ) {
-                    Text("Model: ", style = MaterialTheme.typography.labelLarge)
-                    RadioButton(
-                        selected = selectedModel == "mobilenet_v2.tflite",
-                        onClick = { selectedModel = "mobilenet_v2.tflite" }
-                    )
-                    Text("FP32")
-                    Spacer(modifier = Modifier.width(16.dp))
-                    RadioButton(
-                        selected = selectedModel == "mobilenet_v2_aiedge_int8.tflite",
-                        onClick = { selectedModel = "mobilenet_v2_aiedge_int8.tflite" }
-                    )
-                    Text("INT8")
+                    // Model Row
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.Center,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text("Model: ", style = MaterialTheme.typography.labelMedium)
+                        RadioButton(
+                            selected = selectedModel == "mobilenet_v2.tflite",
+                            onClick = { selectedModel = "mobilenet_v2.tflite" }
+                        )
+                        Text("FP32", style = MaterialTheme.typography.bodySmall)
+                        Spacer(modifier = Modifier.width(8.dp))
+                        RadioButton(
+                            selected = selectedModel == "mobilenet_v2_aiedge_int8.tflite",
+                            onClick = { selectedModel = "mobilenet_v2_aiedge_int8.tflite" }
+                        )
+                        Text("INT8", style = MaterialTheme.typography.bodySmall)
+                    }
+                    
+                    // Runtime Row
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.Center,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text("Runtime: ", style = MaterialTheme.typography.labelMedium)
+                        RadioButton(
+                            selected = selectedRuntime == ImageClassifier.Runtime.INTERPRETER,
+                            onClick = { selectedRuntime = ImageClassifier.Runtime.INTERPRETER }
+                        )
+                        Text("Interpreter", style = MaterialTheme.typography.bodySmall)
+                        Spacer(modifier = Modifier.width(8.dp))
+                        RadioButton(
+                            selected = selectedRuntime == ImageClassifier.Runtime.PLAY_SERVICES,
+                            onClick = { selectedRuntime = ImageClassifier.Runtime.PLAY_SERVICES }
+                        )
+                        Text("PlaySvc", style = MaterialTheme.typography.bodySmall)
+                        Spacer(modifier = Modifier.width(8.dp))
+                        RadioButton(
+                            selected = selectedRuntime == ImageClassifier.Runtime.COMPILED_MODEL,
+                            onClick = { selectedRuntime = ImageClassifier.Runtime.COMPILED_MODEL }
+                        )
+                        Text("LiteRT", style = MaterialTheme.typography.bodySmall)
+                    }
                 }
             }
         }
@@ -115,8 +150,8 @@ fun MainScreen() {
         Box(modifier = Modifier.padding(innerPadding).fillMaxSize()) {
             if (hasCameraPermission) {
                 when (mode) {
-                    AppMode.GALLERY -> GalleryInferenceScreen(selectedModel)
-                    AppMode.CAMERA -> CameraInferenceScreen(selectedModel)
+                    AppMode.GALLERY -> GalleryInferenceScreen(selectedModel, selectedRuntime)
+                    AppMode.CAMERA -> CameraInferenceScreen(selectedModel, selectedRuntime)
                 }
             } else {
                 Text("Camera permission required", modifier = Modifier.align(Alignment.Center))
@@ -128,7 +163,7 @@ fun MainScreen() {
 enum class AppMode { GALLERY, CAMERA }
 
 @Composable
-fun GalleryInferenceScreen(modelName: String) {
+fun GalleryInferenceScreen(modelName: String, runtime: ImageClassifier.Runtime) {
     val context = LocalContext.current
     var selectedImageUri by remember { mutableStateOf<Uri?>(null) }
     var resultBitmap by remember { mutableStateOf<Bitmap?>(null) }
@@ -137,9 +172,12 @@ fun GalleryInferenceScreen(modelName: String) {
     
     val classifier = remember { ImageClassifier(context) }
     
-    // Update model when selection changes
+    // Update model when selection changes (Model OR Runtime)
     LaunchedEffect(modelName) {
         classifier.setModel(modelName)
+    }
+    LaunchedEffect(runtime) {
+        classifier.setRuntime(runtime)
     }
 
     val pickerLauncher = rememberLauncherForActivityResult(
@@ -181,7 +219,7 @@ fun GalleryInferenceScreen(modelName: String) {
 }
 
 @Composable
-fun CameraInferenceScreen(modelName: String) {
+fun CameraInferenceScreen(modelName: String, runtime: ImageClassifier.Runtime) {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
     var results by remember { mutableStateOf<List<Pair<String, Float>>>(emptyList()) }
@@ -192,6 +230,9 @@ fun CameraInferenceScreen(modelName: String) {
     // Update model when selection changes
     LaunchedEffect(modelName) {
         classifier.setModel(modelName)
+    }
+    LaunchedEffect(runtime) {
+        classifier.setRuntime(runtime)
     }
 
     val cameraExecutor = remember { Executors.newSingleThreadExecutor() }
