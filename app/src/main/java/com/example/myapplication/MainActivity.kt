@@ -59,6 +59,8 @@ class MainActivity : ComponentActivity() {
 @Composable
 fun MainScreen() {
     val context = LocalContext.current
+    var selectedModel by remember { mutableStateOf("mobilenet_v2.tflite") }
+    
     var hasCameraPermission by remember {
         mutableStateOf(
             ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
@@ -79,12 +81,33 @@ fun MainScreen() {
 
     Scaffold(
         topBar = {
-            TabRow(selectedTabIndex = mode.ordinal) {
-                Tab(selected = mode == AppMode.GALLERY, onClick = { mode = AppMode.GALLERY }) {
-                    Text("Gallery", modifier = Modifier.padding(16.dp))
+            Column {
+                TabRow(selectedTabIndex = mode.ordinal) {
+                    Tab(selected = mode == AppMode.GALLERY, onClick = { mode = AppMode.GALLERY }) {
+                        Text("Gallery", modifier = Modifier.padding(16.dp))
+                    }
+                    Tab(selected = mode == AppMode.CAMERA, onClick = { mode = AppMode.CAMERA }) {
+                        Text("Camera", modifier = Modifier.padding(16.dp))
+                    }
                 }
-                Tab(selected = mode == AppMode.CAMERA, onClick = { mode = AppMode.CAMERA }) {
-                    Text("Camera", modifier = Modifier.padding(16.dp))
+                // Model Selector
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(8.dp),
+                    horizontalArrangement = Arrangement.Center,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text("Model: ", style = MaterialTheme.typography.labelLarge)
+                    RadioButton(
+                        selected = selectedModel == "mobilenet_v2.tflite",
+                        onClick = { selectedModel = "mobilenet_v2.tflite" }
+                    )
+                    Text("FP32")
+                    Spacer(modifier = Modifier.width(16.dp))
+                    RadioButton(
+                        selected = selectedModel == "mobilenet_v2_aiedge_int8.tflite",
+                        onClick = { selectedModel = "mobilenet_v2_aiedge_int8.tflite" }
+                    )
+                    Text("INT8")
                 }
             }
         }
@@ -92,8 +115,8 @@ fun MainScreen() {
         Box(modifier = Modifier.padding(innerPadding).fillMaxSize()) {
             if (hasCameraPermission) {
                 when (mode) {
-                    AppMode.GALLERY -> GalleryInferenceScreen()
-                    AppMode.CAMERA -> CameraInferenceScreen()
+                    AppMode.GALLERY -> GalleryInferenceScreen(selectedModel)
+                    AppMode.CAMERA -> CameraInferenceScreen(selectedModel)
                 }
             } else {
                 Text("Camera permission required", modifier = Modifier.align(Alignment.Center))
@@ -105,7 +128,7 @@ fun MainScreen() {
 enum class AppMode { GALLERY, CAMERA }
 
 @Composable
-fun GalleryInferenceScreen() {
+fun GalleryInferenceScreen(modelName: String) {
     val context = LocalContext.current
     var selectedImageUri by remember { mutableStateOf<Uri?>(null) }
     var resultBitmap by remember { mutableStateOf<Bitmap?>(null) }
@@ -113,6 +136,11 @@ fun GalleryInferenceScreen() {
     var inferenceTime by remember { mutableStateOf(0L) }
     
     val classifier = remember { ImageClassifier(context) }
+    
+    // Update model when selection changes
+    LaunchedEffect(modelName) {
+        classifier.setModel(modelName)
+    }
 
     val pickerLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.GetContent(),
@@ -153,13 +181,19 @@ fun GalleryInferenceScreen() {
 }
 
 @Composable
-fun CameraInferenceScreen() {
+fun CameraInferenceScreen(modelName: String) {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
     var results by remember { mutableStateOf<List<Pair<String, Float>>>(emptyList()) }
     var inferenceTime by remember { mutableStateOf(0L) }
     
     val classifier = remember { ImageClassifier(context) }
+    
+    // Update model when selection changes
+    LaunchedEffect(modelName) {
+        classifier.setModel(modelName)
+    }
+
     val cameraExecutor = remember { Executors.newSingleThreadExecutor() }
 
     Box(modifier = Modifier.fillMaxSize()) {
