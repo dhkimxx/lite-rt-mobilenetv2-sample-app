@@ -61,31 +61,20 @@ dependencies {
 
 
 
-    // LiteRT 2.1.0 - Replaces bundled TFLite
-    implementation(libs.litert)
+    // TensorFlow Lite (Standard)
+    implementation(libs.tensorflow.lite)
+    implementation(libs.tensorflow.lite.gpu)
+    implementation(libs.tensorflow.lite.gpu.api)
     
-    // TFLite Support & Metadata (exclude conflicting TFLite APIs provided by LiteRT)
-    implementation(libs.tensorflow.lite.support) {
-        exclude(group = "org.tensorflow", module = "tensorflow-lite-api")
-        exclude(group = "org.tensorflow", module = "tensorflow-lite")
-    }
-    implementation(libs.tensorflow.lite.metadata) {
-        exclude(group = "org.tensorflow", module = "tensorflow-lite-api")
-        exclude(group = "org.tensorflow", module = "tensorflow-lite")
-    }
+    // TFLite Support & Metadata
+    implementation(libs.tensorflow.lite.support)
+    implementation(libs.tensorflow.lite.metadata)
     
     // CameraX
     implementation(libs.androidx.camera.core)
     implementation(libs.androidx.camera.camera2)
     implementation(libs.androidx.camera.lifecycle)
     implementation(libs.androidx.camera.view)
-    
-    // Google Play Services TFLite (exclude conflicting TFLite APIs)
-    implementation(libs.play.services.tflite.java) {
-        exclude(group = "org.tensorflow", module = "tensorflow-lite-api")
-        exclude(group = "org.tensorflow", module = "tensorflow-lite")
-    }
-
 
     testImplementation(libs.junit)
     androidTestImplementation(libs.androidx.junit)
@@ -94,12 +83,4 @@ dependencies {
     androidTestImplementation(libs.androidx.compose.ui.test.junit4)
     debugImplementation(libs.androidx.compose.ui.tooling)
     debugImplementation(libs.androidx.compose.ui.test.manifest)
-}
-
-android {
-    packagingOptions {
-        resources {
-            pickFirsts.add("org/tensorflow/lite/**/*")
-        }
-    }
 }

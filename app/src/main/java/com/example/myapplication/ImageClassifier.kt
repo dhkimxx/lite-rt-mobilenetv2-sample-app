@@ -4,6 +4,9 @@ import android.content.Context
 import android.graphics.Bitmap
 import org.tensorflow.lite.DataType
 import org.tensorflow.lite.Interpreter
+import org.tensorflow.lite.gpu.CompatibilityList
+import org.tensorflow.lite.gpu.GpuDelegate
+import org.tensorflow.lite.nnapi.NnApiDelegate
 import org.tensorflow.lite.support.common.FileUtil
 import org.tensorflow.lite.support.common.ops.NormalizeOp
 import org.tensorflow.lite.support.image.ImageProcessor
@@ -12,607 +15,293 @@ import org.tensorflow.lite.support.image.ops.ResizeOp
 import org.tensorflow.lite.support.tensorbuffer.TensorBuffer
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
-import java.nio.MappedByteBuffer
-import kotlin.math.exp
 
-/**
- * NCHW 변환 및 버퍼 관리를 위한 유틸리티 객체
- * DRY 원칙 준수를 위해 공통 로직 분리
- */
-object ImageUtils {
-    
-    /**
-     * NHWC -> NCHW 변환 (Float32)
-     * @param nhwcBuffer NHWC 포맷의 소스 버퍼
-     * @param height 이미지 높이
-     * @param width 이미지 너비
-     * @param destBuffer 재사용할 대상 버퍼 (null이면 새로 생성)
-     * @return NCHW 포맷으로 변환된 ByteBuffer
-     */
-    fun permuteNHWCToNCHW_Float(
-        nhwcBuffer: ByteBuffer,
-        height: Int,
-        width: Int,
-        destBuffer: ByteBuffer? = null
-    ): ByteBuffer {
-        nhwcBuffer.rewind()
-        val floatBuffer = nhwcBuffer.asFloatBuffer()
-        val nhwcArray = FloatArray(floatBuffer.remaining())
-        floatBuffer.get(nhwcArray)
-        
-        val nchwArray = FloatArray(nhwcArray.size)
-        for (h in 0 until height) {
-            for (w in 0 until width) {
-                val pixelIndex = (h * width) + w
-                nchwArray[pixelIndex] = nhwcArray[pixelIndex * 3 + 0]             // R
-                nchwArray[(height * width) + pixelIndex] = nhwcArray[pixelIndex * 3 + 1]  // G
-                nchwArray[(2 * height * width) + pixelIndex] = nhwcArray[pixelIndex * 3 + 2] // B
-            }
-        }
-        
-        val outputBuffer = destBuffer ?: ByteBuffer.allocateDirect(nchwArray.size * 4)
-        outputBuffer.order(ByteOrder.nativeOrder())
-        outputBuffer.rewind()
-        outputBuffer.asFloatBuffer().put(nchwArray)
-        outputBuffer.rewind()
-        return outputBuffer
-    }
-    
-    /**
-     * NHWC -> NCHW 변환 (UINT8)
-     * @param nhwcBuffer NHWC 포맷의 소스 버퍼
-     * @param height 이미지 높이
-     * @param width 이미지 너비
-     * @param destBuffer 재사용할 대상 버퍼 (null이면 새로 생성)
-     * @return NCHW 포맷으로 변환된 ByteBuffer
-     */
-    fun permuteNHWCToNCHW_Uint8(
-        nhwcBuffer: ByteBuffer,
-        height: Int,
-        width: Int,
-        destBuffer: ByteBuffer? = null
-    ): ByteBuffer {
-        nhwcBuffer.rewind()
-        val nhwcArray = ByteArray(nhwcBuffer.remaining())
-        nhwcBuffer.get(nhwcArray)
-        
-        val nchwArray = ByteArray(nhwcArray.size)
-        for (h in 0 until height) {
-            for (w in 0 until width) {
-                val pixelIndex = (h * width) + w
-                nchwArray[pixelIndex] = nhwcArray[pixelIndex * 3 + 0]             // R
-                nchwArray[(height * width) + pixelIndex] = nhwcArray[pixelIndex * 3 + 1]  // G
-                nchwArray[(2 * height * width) + pixelIndex] = nhwcArray[pixelIndex * 3 + 2] // B
-            }
-        }
-        
-        val outputBuffer = destBuffer ?: ByteBuffer.allocateDirect(nchwArray.size)
-        outputBuffer.order(ByteOrder.nativeOrder())
-        outputBuffer.rewind()
-        outputBuffer.put(nchwArray)
-        outputBuffer.rewind()
-        return outputBuffer
-    }
-    
-    /**
-     * 입력 Shape가 NCHW 포맷인지 확인
-     */
-    fun isNCHW(shape: IntArray): Boolean {
-        return shape.size == 4 && shape[1] == 3
-    }
-}
-
-/**
- * ModelRunner 인터페이스
- * 전략 패턴: 다양한 추론 런타임을 추상화
- */
-interface ModelRunner {
-    fun load(modelName: String)
-    fun classify(
-        tensorImage: TensorImage,
-        imageProcessor: ImageProcessor
-    ): Pair<TensorBuffer, Long>
-    fun getInputDataType(): DataType
-    fun getOutputDataType(): DataType
-    fun getInputShape(): IntArray
-    fun getOutputShape(): IntArray
-    fun close()
-}
-
-/**
- * 1. 앱 내장 TFLite Interpreter 구현체
- * 버퍼 재사용 최적화 적용
- */
-class InterpreterRunner(private val context: Context) : ModelRunner {
-    private var interpreter: Interpreter? = null
-    
-    // 버퍼 재사용을 위한 멤버 변수 (load 시점에 할당)
-    private var inputBuffer: ByteBuffer? = null
-    private var outputBuffer: TensorBuffer? = null
-    private var cachedInputShape: IntArray = intArrayOf(1, 224, 224, 3)
-    private var cachedOutputShape: IntArray = intArrayOf(1, 1001)
-    private var isNCHW: Boolean = false
-    
-    override fun load(modelName: String) {
-        close()
-        try {
-            val model: MappedByteBuffer = FileUtil.loadMappedFile(context, modelName)
-            val options = Interpreter.Options()
-            interpreter = Interpreter(model, options)
-            
-            // 버퍼 사전 할당
-            cachedInputShape = interpreter?.getInputTensor(0)?.shape() ?: intArrayOf(1, 224, 224, 3)
-            cachedOutputShape = interpreter?.getOutputTensor(0)?.shape() ?: intArrayOf(1, 1001)
-            isNCHW = ImageUtils.isNCHW(cachedInputShape)
-            
-            val inputDataType = getInputDataType()
-            val inputSize = cachedInputShape.reduce { acc, i -> acc * i }
-            val bytesPerElement = if (inputDataType == DataType.FLOAT32) 4 else 1
-            inputBuffer = ByteBuffer.allocateDirect(inputSize * bytesPerElement).order(ByteOrder.nativeOrder())
-            
-            outputBuffer = TensorBuffer.createFixedSize(cachedOutputShape, getOutputDataType())
-            
-            android.util.Log.d("InterpreterRunner", "Loaded $modelName, NCHW: $isNCHW, Input: $inputDataType")
-        } catch (e: Exception) {
-            e.printStackTrace()
-            android.util.Log.e("InterpreterRunner", "Error loading model: ${e.message}")
-        }
-    }
-
-    override fun classify(
-        tensorImage: TensorImage, 
-        imageProcessor: ImageProcessor
-    ): Pair<TensorBuffer, Long> {
-        if (interpreter == null || inputBuffer == null || outputBuffer == null) {
-            return Pair(TensorBuffer.createFixedSize(cachedOutputShape, DataType.FLOAT32), 0L)
-        }
-        
-        val processedImage = imageProcessor.process(tensorImage)
-        outputBuffer!!.buffer.rewind()
-        
-        val finalInputBuffer: ByteBuffer = if (isNCHW) {
-            val height = cachedInputShape[2]
-            val width = cachedInputShape[3]
-            if (getInputDataType() == DataType.FLOAT32) {
-                ImageUtils.permuteNHWCToNCHW_Float(processedImage.buffer, height, width, inputBuffer)
-            } else {
-                ImageUtils.permuteNHWCToNCHW_Uint8(processedImage.buffer, height, width, inputBuffer)
-            }
-        } else {
-            processedImage.buffer.also { it.rewind() }
-        }
-        
-        val startTime = android.os.SystemClock.uptimeMillis()
-        interpreter?.run(finalInputBuffer, outputBuffer!!.buffer)
-        val inferenceTime = android.os.SystemClock.uptimeMillis() - startTime
-        
-        return Pair(outputBuffer!!, inferenceTime)
-    }
-
-    override fun getInputDataType(): DataType = interpreter?.getInputTensor(0)?.dataType() ?: DataType.FLOAT32
-    override fun getOutputDataType(): DataType = interpreter?.getOutputTensor(0)?.dataType() ?: DataType.FLOAT32
-    override fun getInputShape(): IntArray = cachedInputShape
-    override fun getOutputShape(): IntArray = cachedOutputShape
-
-    override fun close() {
-        interpreter?.close()
-        interpreter = null
-        inputBuffer = null
-        outputBuffer = null
-    }
-}
-
-/**
- * 2. Google Play Services TFLite Runtime 구현체
- * InterpreterApi + TfLiteRuntime.FROM_SYSTEM_ONLY 사용
- */
-class PlayServicesRunner(private val context: Context) : ModelRunner {
-    private var interpreter: org.tensorflow.lite.InterpreterApi? = null
-    private var modelBuffer: MappedByteBuffer? = null
-    
-    // 버퍼 재사용을 위한 멤버 변수
-    private var inputBuffer: ByteBuffer? = null
-    private var outputBuffer: TensorBuffer? = null
-    private var cachedInputShape: IntArray = intArrayOf(1, 224, 224, 3)
-    private var cachedOutputShape: IntArray = intArrayOf(1, 1001)
-    private var isNCHW: Boolean = false
-    private var pendingModelName: String? = null
-    
-    override fun load(modelName: String) {
-        close()
-        pendingModelName = modelName
-        try {
-            // Play Services TFLite 초기화 (비동기, 필수!)
-            com.google.android.gms.tflite.java.TfLite.initialize(context).addOnSuccessListener {
-                android.util.Log.d("PlayServicesRunner", "TfLite initialized successfully")
-                loadModelAfterInit(modelName)
-            }.addOnFailureListener { e ->
-                android.util.Log.e("PlayServicesRunner", "TfLite initialization failed: ${e.toString()}")
-            }
-        } catch (e: Exception) {
-            e.printStackTrace()
-            android.util.Log.e("PlayServicesRunner", "Error initializing TfLite: ${e.message}")
-        }
-    }
-    
-    private fun loadModelAfterInit(modelName: String) {
-        try {
-            modelBuffer = FileUtil.loadMappedFile(context, modelName)
-            
-            val options = org.tensorflow.lite.InterpreterApi.Options()
-                // .setRuntime(org.tensorflow.lite.InterpreterApi.Options.TfLiteRuntime.FROM_SYSTEM_ONLY)
-            
-            interpreter = org.tensorflow.lite.InterpreterApi.create(modelBuffer!!, options)
-            
-            // 버퍼 사전 할당
-            cachedInputShape = interpreter?.getInputTensor(0)?.shape() ?: intArrayOf(1, 224, 224, 3)
-            cachedOutputShape = interpreter?.getOutputTensor(0)?.shape() ?: intArrayOf(1, 1001)
-            isNCHW = ImageUtils.isNCHW(cachedInputShape)
-            
-            val inputDataType = getInputDataType()
-            val inputSize = cachedInputShape.reduce { acc, i -> acc * i }
-            val bytesPerElement = if (inputDataType == DataType.FLOAT32) 4 else 1
-            inputBuffer = ByteBuffer.allocateDirect(inputSize * bytesPerElement).order(ByteOrder.nativeOrder())
-            
-            outputBuffer = TensorBuffer.createFixedSize(cachedOutputShape, getOutputDataType())
-            
-            android.util.Log.d("PlayServicesRunner", "Loaded $modelName via Play Services, NCHW: $isNCHW, Input: $inputDataType")
-        } catch (e: Exception) {
-            e.printStackTrace()
-            android.util.Log.e("PlayServicesRunner", "Error creating interpreter: ${e.message}")
-        }
-    }
-
-    override fun classify(
-        tensorImage: TensorImage,
-        imageProcessor: ImageProcessor
-    ): Pair<TensorBuffer, Long> {
-        if (interpreter == null || inputBuffer == null || outputBuffer == null) {
-            return Pair(TensorBuffer.createFixedSize(cachedOutputShape, DataType.FLOAT32), 0L)
-        }
-        
-        val processedImage = imageProcessor.process(tensorImage)
-        outputBuffer!!.buffer.rewind()
-        
-        val finalInputBuffer: ByteBuffer = if (isNCHW) {
-            val height = cachedInputShape[2]
-            val width = cachedInputShape[3]
-            if (getInputDataType() == DataType.FLOAT32) {
-                ImageUtils.permuteNHWCToNCHW_Float(processedImage.buffer, height, width, inputBuffer)
-            } else {
-                ImageUtils.permuteNHWCToNCHW_Uint8(processedImage.buffer, height, width, inputBuffer)
-            }
-        } else {
-            processedImage.buffer.also { it.rewind() }
-        }
-        
-        val startTime = android.os.SystemClock.uptimeMillis()
-        interpreter?.run(finalInputBuffer, outputBuffer!!.buffer)
-        val inferenceTime = android.os.SystemClock.uptimeMillis() - startTime
-        
-        return Pair(outputBuffer!!, inferenceTime)
-    }
-
-    override fun getInputDataType(): DataType = interpreter?.getInputTensor(0)?.dataType() ?: DataType.FLOAT32
-    override fun getOutputDataType(): DataType = interpreter?.getOutputTensor(0)?.dataType() ?: DataType.FLOAT32
-    override fun getInputShape(): IntArray = cachedInputShape
-    override fun getOutputShape(): IntArray = cachedOutputShape
-
-    override fun close() {
-        interpreter?.close()
-        interpreter = null
-        inputBuffer = null
-        outputBuffer = null
-    }
-}
-
-/**
- * 3. LiteRT CompiledModel Runtime 구현체
- * 최신 LiteRT 2.1.0 CompiledModel API 사용 (Kotlin 2.1.0+ 필요)
- */
-class CompiledModelRunner(private val context: Context) : ModelRunner {
-    private var compiledModel: com.google.ai.edge.litert.CompiledModel? = null
-    private var litertInputBuffers: List<Any>? = null
-    private var litertOutputBuffers: List<Any>? = null
-    
-    // 버퍼 재사용을 위한 멤버 변수
-    private var inputBuffer: ByteBuffer? = null
-    private var supportOutputBuffer: TensorBuffer? = null // TFLite Support's TensorBuffer
-    private var cachedInputShape: IntArray = intArrayOf(1, 224, 224, 3)
-    private var cachedOutputShape: IntArray = intArrayOf(1, 1001)
-    private var cachedInputDataType: DataType = DataType.FLOAT32
-    private var cachedOutputDataType: DataType = DataType.FLOAT32
-    private var isNCHW: Boolean = false
-    
-    override fun load(modelName: String) {
-        close()
-        try {
-            // assets에서 캐시 디렉토리로 모델 복사 (CompiledModel은 파일 경로 필요)
-            val cacheFile = java.io.File(context.cacheDir, modelName)
-            if (!cacheFile.exists()) {
-                context.assets.open(modelName).use { inputStream ->
-                    java.io.FileOutputStream(cacheFile).use { outputStream ->
-                        inputStream.copyTo(outputStream)
-                    }
-                }
-            }
-            
-            // CompiledModel 생성 (파일 경로 사용)
-            compiledModel = com.google.ai.edge.litert.CompiledModel.create(cacheFile.absolutePath)
-            
-            // LiteRT TensorBuffers 사전 할당
-            compiledModel?.let { model ->
-                try {
-                    val createInputMethod = model.javaClass.getMethod("createInputBuffers")
-                    val createOutputMethod = model.javaClass.getMethod("createOutputBuffers")
-                    litertInputBuffers = createInputMethod.invoke(model) as? List<Any>
-                    litertOutputBuffers = createOutputMethod.invoke(model) as? List<Any>
-                    android.util.Log.d("CompiledModelRunner", "Pre-allocated LiteRT TensorBuffers")
-                } catch (e: Exception) {
-                    android.util.Log.e("CompiledModelRunner", "Failed to pre-allocate LiteRT buffers: ${e.message}")
-                }
-            }
-            
-            // shape와 타입 캐싱 (classify에서 동적 재할당하므로 기본값 설정)
-            isNCHW = true
-            cachedInputShape = intArrayOf(1, 3, 224, 224)
-            cachedOutputShape = intArrayOf(1, 1001)
-            cachedInputDataType = if (modelName.contains("int8")) DataType.UINT8 else DataType.FLOAT32
-            cachedOutputDataType = DataType.FLOAT32
-            
-            // 버퍼 사전 할당
-            val inputSize = cachedInputShape.reduce { acc, i -> acc * i }
-            val bytesPerElement = if (cachedInputDataType == DataType.FLOAT32) 4 else 1
-            inputBuffer = ByteBuffer.allocateDirect(inputSize * bytesPerElement).order(ByteOrder.nativeOrder())
-            
-            supportOutputBuffer = TensorBuffer.createFixedSize(cachedOutputShape, cachedOutputDataType)
-            
-            android.util.Log.d("CompiledModelRunner", "Loaded $modelName via CompiledModel, NCHW: $isNCHW, Input: $cachedInputDataType, Output: ${cachedOutputShape.contentToString()}")
-        } catch (e: Exception) {
-            e.printStackTrace()
-            android.util.Log.e("CompiledModelRunner", "Error loading CompiledModel: ${e.message}")
-        }
-    }
-
-    override fun classify(
-        tensorImage: TensorImage,
-        imageProcessor: ImageProcessor
-    ): Pair<TensorBuffer, Long> {
-        val model = compiledModel
-        val inBuffers = litertInputBuffers
-        val outBuffers = litertOutputBuffers
-        
-        if (model == null || inputBuffer == null || supportOutputBuffer == null || inBuffers == null || outBuffers == null) {
-            return Pair(TensorBuffer.createFixedSize(cachedOutputShape, DataType.FLOAT32), 0L)
-        }
-        
-        // 1. 이미지 전처리
-        val processedImage = imageProcessor.process(tensorImage)
-        
-        // 2. NCHW 변환 및 입력 버퍼 로드
-        inputBuffer!!.rewind()
-        if (isNCHW) {
-            val height = cachedInputShape[2]
-            val width = cachedInputShape[3]
-            if (cachedInputDataType == DataType.FLOAT32) {
-                ImageUtils.permuteNHWCToNCHW_Float(processedImage.buffer, height, width, inputBuffer!!)
-            } else {
-                ImageUtils.permuteNHWCToNCHW_Uint8(processedImage.buffer, height, width, inputBuffer!!)
-            }
-        } else {
-            inputBuffer!!.put(processedImage.buffer)
-        }
-        
-        val startTime = android.os.SystemClock.uptimeMillis()
-        
-        // 3. LiteRT TensorBuffer에 데이터 로드
-        try {
-            val inputTensor = inBuffers[0]
-            val outputTensor = outBuffers[0]
-            
-            if (cachedInputDataType == DataType.FLOAT32) {
-                val floatArray = FloatArray(inputBuffer!!.remaining() / 4)
-                inputBuffer!!.rewind()
-                inputBuffer!!.asFloatBuffer().get(floatArray)
-                
-                val writeMethod = inputTensor.javaClass.getMethod("writeFloat", FloatArray::class.java)
-                writeMethod.invoke(inputTensor, floatArray)
-            } else {
-                val byteArray = ByteArray(inputBuffer!!.remaining())
-                inputBuffer!!.rewind()
-                inputBuffer!!.get(byteArray)
-                
-                val writeMethod = inputTensor.javaClass.getMethod("writeInt8", ByteArray::class.java)
-                writeMethod.invoke(inputTensor, byteArray)
-            }
-            
-            // 4. 모델 실행 (CompiledModel)
-            val runMethod = model.javaClass.getMethod("run", java.util.List::class.java, java.util.List::class.java)
-            runMethod.invoke(model, inBuffers, outBuffers)
-            
-            // 5. 출력 결과 복사
-            val readMethod = if (cachedOutputDataType == DataType.FLOAT32) {
-                outputTensor.javaClass.getMethod("readFloat")
-            } else {
-                outputTensor.javaClass.getMethod("readInt8")
-            }
-            
-            val resultArray = readMethod.invoke(outputTensor)
-            if (resultArray is FloatArray) {
-                if (resultArray.size != supportOutputBuffer!!.flatSize) {
-                    android.util.Log.w("CompiledModelRunner", "Output size mismatch. Expected: ${supportOutputBuffer!!.flatSize}, Got: ${resultArray.size}. Re-allocating.")
-                    cachedOutputShape = intArrayOf(1, resultArray.size)
-                    supportOutputBuffer = TensorBuffer.createFixedSize(cachedOutputShape, cachedOutputDataType)
-                }
-                supportOutputBuffer!!.loadArray(resultArray)
-            } else if (resultArray is ByteArray) {
-                if (resultArray.size != supportOutputBuffer!!.flatSize) {
-                    android.util.Log.w("CompiledModelRunner", "Output byte size mismatch. Expected: ${supportOutputBuffer!!.flatSize}, Got: ${resultArray.size}. Re-allocating.")
-                    cachedOutputShape = intArrayOf(1, resultArray.size)
-                    supportOutputBuffer = TensorBuffer.createFixedSize(cachedOutputShape, cachedOutputDataType)
-                }
-                val floatArray = FloatArray(resultArray.size) { resultArray[it].toFloat() }
-                supportOutputBuffer!!.loadArray(floatArray)
-            }
-            
-        } catch (e: Exception) {
-            android.util.Log.e("CompiledModelRunner", "Inference failed: ${e.toString()}")
-            e.cause?.let { android.util.Log.e("CompiledModelRunner", "Cause: ${it.toString()}") }
-        }
-        
-        val inferenceTime = android.os.SystemClock.uptimeMillis() - startTime
-        return Pair(supportOutputBuffer!!, inferenceTime)
-    }
-
-    override fun getInputDataType(): DataType = cachedInputDataType
-    override fun getOutputDataType(): DataType = cachedOutputDataType
-    override fun getInputShape(): IntArray = cachedInputShape
-    override fun getOutputShape(): IntArray = cachedOutputShape
-
-    override fun close() {
-        try {
-            compiledModel?.close()
-        } catch (e: Exception) {
-            android.util.Log.e("CompiledModelRunner", "Error closing CompiledModel: ${e.message}")
-        }
-        compiledModel = null
-        inputBuffer = null
-        supportOutputBuffer = null
-        litertInputBuffers = null
-        litertOutputBuffers = null
-    }
-}
-
-/**
- * 이미지 분류 결과
- */
-data class InferenceResult(
-    val predictions: List<Pair<String, Float>>,
-    val inferenceTime: Long
-)
-
-/**
- * ImageClassifier - 고수준 API
- * ModelRunner를 사용하여 런타임 독립적으로 동작
- */
 class ImageClassifier(private val context: Context) {
 
-    private var labels: List<String> = emptyList()
-    private val lock = Any()
-    
-    enum class Runtime {
-        INTERPRETER,      // 앱 내장 TFLite 라이브러리
-        PLAY_SERVICES,    // Google Play Services TFLite
-        COMPILED_MODEL    // LiteRT CompiledModel API
+    enum class HardwareAccel {
+        CPU, GPU, NPU
     }
 
-    private var currentRuntime: Runtime = Runtime.INTERPRETER
-    private var modelWrapper: ModelRunner = InterpreterRunner(context)
-    
-    private var inputImageWidth: Int = 224
-    private var inputImageHeight: Int = 224
-    private var modelName = "mobilenet_v2.tflite"
+    private val lock = Any()
 
     init {
-        loadLabels()
-        loadModel(modelName, currentRuntime)
+        initialize()
     }
+
+    private var interpreter: Interpreter? = null
+    private var inputImageBuffer: TensorImage? = null
+    private var outputProbabilityBuffer: TensorBuffer? = null
     
-    private fun loadLabels() {
-        labels = try {
-            FileUtil.loadLabels(context, "labels.txt")
-        } catch (e: Exception) {
-            (0 until 1001).map { it.toString() }
+    // 캐시된 모델 정보
+    private var cachedInputShape: IntArray = intArrayOf(1, 224, 224, 3)
+    private var cachedOutputShape: IntArray = intArrayOf(1, 1001)
+    private var inputDataType: DataType = DataType.FLOAT32
+    private var outputDataType: DataType = DataType.FLOAT32
+    
+    // Delegate 참조 (닫기 위해 필요)
+    private var gpuDelegate: GpuDelegate? = null
+    private var nnApiDelegate: NnApiDelegate? = null
+    
+    // 현재 설정
+    private var currentModelName: String = "mobilenet_v2.tflite"
+    private var currentAccel: HardwareAccel = HardwareAccel.CPU
+
+    fun initialize(modelName: String = "mobilenet_v2.tflite", accel: HardwareAccel = HardwareAccel.CPU) {
+        synchronized(lock) {
+            currentModelName = modelName
+            currentAccel = accel
+            loadModel()
         }
     }
 
-    fun setModel(newModelName: String) {
-        synchronized(lock) {
-            if (modelName != newModelName) {
-                modelName = newModelName
-                loadModel(modelName, currentRuntime)
-            }
-        }
-    }
-    
-    fun setRuntime(newRuntime: Runtime) {
-        synchronized(lock) {
-            if (currentRuntime != newRuntime) {
-                currentRuntime = newRuntime
-                modelWrapper.close()
-                modelWrapper = when (newRuntime) {
-                    Runtime.INTERPRETER -> InterpreterRunner(context)
-                    Runtime.PLAY_SERVICES -> PlayServicesRunner(context)
-                    Runtime.COMPILED_MODEL -> CompiledModelRunner(context)
-                }
-                loadModel(modelName, currentRuntime)
-            }
-        }
-    }
+    private var isNCHW: Boolean = false
+    private var inputBuffer: ByteBuffer? = null
 
-    private fun loadModel(fileName: String, runtime: Runtime) {
+    private fun loadModel() {
+        close() // Internal close, safe because initialize holds lock
         try {
-            modelWrapper.load(fileName)
+            val modelBuffer = FileUtil.loadMappedFile(context, currentModelName)
+            val options = Interpreter.Options()
             
-            val inputShape = modelWrapper.getInputShape()
-            if (inputShape.size == 4) {
-                if (ImageUtils.isNCHW(inputShape)) {
-                    inputImageHeight = inputShape[2]
-                    inputImageWidth = inputShape[3]
-                } else {
-                    inputImageHeight = inputShape[1]
-                    inputImageWidth = inputShape[2]
+            when (currentAccel) {
+                HardwareAccel.GPU -> {
+                    if (CompatibilityList().isDelegateSupportedOnThisDevice) {
+                        gpuDelegate = GpuDelegate()
+                        options.addDelegate(gpuDelegate)
+                        android.util.Log.d("ImageClassifier", "Initialized GPU Delegate")
+                    } else {
+                        android.util.Log.w("ImageClassifier", "GPU Delegate not supported on this device. Falling back to CPU.")
+                    }
+                }
+                HardwareAccel.NPU -> {
+                    nnApiDelegate = NnApiDelegate()
+                    options.addDelegate(nnApiDelegate)
+                    android.util.Log.d("ImageClassifier", "Initialized NNApi Delegate")
+                }
+                HardwareAccel.CPU -> {
+                    options.setUseXNNPACK(true) // XNNPACK은 CPU 가속을 위해 기본적으로 활성화 권장
+                    android.util.Log.d("ImageClassifier", "Initialized CPU (XNNPACK)")
                 }
             }
+            interpreter = Interpreter(modelBuffer, options)
             
-            android.util.Log.d("ImageClassifier", "Loaded $fileName with $runtime. Input: ${modelWrapper.getInputDataType()}")
+            // 텐서 정보 읽기
+            val inputTensor = interpreter!!.getInputTensor(0)
+            val outputTensor = interpreter!!.getOutputTensor(0)
+            
+            cachedInputShape = inputTensor.shape()
+            cachedOutputShape = outputTensor.shape()
+            inputDataType = inputTensor.dataType()
+            outputDataType = outputTensor.dataType()
+            
+            // NCHW 감지 ( [1, 3, H, W] )
+            isNCHW = cachedInputShape.size == 4 && cachedInputShape[1] == 3
+            
+            if (isNCHW && currentAccel != HardwareAccel.CPU) {
+                // Warning: NCHW on GPU/NPU might be unstable.
+                android.util.Log.w("ImageClassifier", "NCHW model detected with GPU/NPU. If crash occurs, please switch to CPU.")
+            }
 
+            android.util.Log.d("ImageClassifier", "Model loaded: $currentModelName, Input: $inputDataType, Shape: ${cachedInputShape.contentToString()}, NCHW: $isNCHW")
+            
+            // 버퍼 초기화
+            // TensorImage는 NHWC를 다루지만, NCHW 변환을 위한 별도 ByteBuffer가 필요할 수 있음
+            inputImageBuffer = TensorImage(inputDataType)
+            outputProbabilityBuffer = TensorBuffer.createFixedSize(cachedOutputShape, outputDataType)
+            
+            if (isNCHW) {
+                val inputSize = cachedInputShape.reduce { acc, i -> acc * i }
+                val bytesPerElement = if (inputDataType == DataType.FLOAT32) 4 else 1
+                inputBuffer = ByteBuffer.allocateDirect(inputSize * bytesPerElement).order(ByteOrder.nativeOrder())
+            }
+            
         } catch (e: Exception) {
+            android.util.Log.e("ImageClassifier", "Error loading model: ${e.message}")
             e.printStackTrace()
         }
     }
 
-    fun classify(bitmap: Bitmap): InferenceResult {
+    fun classify(bitmap: Bitmap): Pair<String, Long> {
         synchronized(lock) {
-            // 인터프리터에서 직접 DataType 가져옴 (해킹 제거)
-            val inputDataType = modelWrapper.getInputDataType()
+            if (interpreter == null) return Pair("Error: Model not loaded", 0)
 
-            val imageProcessorBuilder = ImageProcessor.Builder()
-                .add(ResizeOp(inputImageHeight, inputImageWidth, ResizeOp.ResizeMethod.BILINEAR))
+            val startTime = android.os.SystemClock.uptimeMillis()
 
-            if (inputDataType == DataType.FLOAT32) {
-                imageProcessorBuilder.add(NormalizeOp(127.5f, 127.5f))
+            // 1. 이미지 전처리 (입력 Shape에 맞게 Resize)
+            val height = if (isNCHW) cachedInputShape[2] else cachedInputShape[1]
+            val width = if (isNCHW) cachedInputShape[3] else cachedInputShape[2]
+
+            val imageProcessor = ImageProcessor.Builder()
+                .add(ResizeOp(height, width, ResizeOp.ResizeMethod.BILINEAR))
+                .add(NormalizeOp(127.5f, 127.5f)) // [0, 255] -> [-1, 1]
+                .build()
+
+            inputImageBuffer!!.load(bitmap)
+            val processedImage = imageProcessor.process(inputImageBuffer)
+
+            // 2. 추론
+            try {
+                if (isNCHW) {
+                    // NHWC -> NCHW 변환
+                    if (inputBuffer == null) throw IllegalStateException("Input buffer not initialized for NCHW")
+                    inputBuffer!!.rewind()
+
+                    if (inputDataType == DataType.FLOAT32) {
+                        ImageUtils.permuteNHWCToNCHW_Float(processedImage.buffer, height, width, inputBuffer!!)
+                    } else {
+                        ImageUtils.permuteNHWCToNCHW_Uint8(processedImage.buffer, height, width, inputBuffer!!)
+                    }
+
+                    inputBuffer!!.rewind()
+                    interpreter!!.run(inputBuffer, outputProbabilityBuffer!!.buffer.rewind())
+                } else {
+                    // NHWC 그대로 전달
+                    interpreter!!.run(processedImage.buffer, outputProbabilityBuffer!!.buffer.rewind())
+                }
+            } catch (e: Exception) {
+                android.util.Log.e("ImageClassifier", "Inference failed: ${e.message}")
+                return Pair("Error: Inference failed", 0)
             }
 
-            val imageProcessor = imageProcessorBuilder.build()
-            val tensorImage = TensorImage(inputDataType)
-            tensorImage.load(bitmap)
-            
-            val (outputBuffer, time) = modelWrapper.classify(tensorImage, imageProcessor)
-            
-            // 출력 처리
-            val outputArray = outputBuffer.floatArray
-            val probabilities = softmax(outputArray)
+            val inferenceTime = android.os.SystemClock.uptimeMillis() - startTime
 
-            val topPredictions = probabilities
-                .mapIndexed { index, value -> Pair(labels.getOrElse(index) { index.toString() }, value) }
-                .sortedByDescending { it.second }
-                .take(5)
+            // 3. 결과 후처리
+            val labeledProbability = getTopKLabels(outputProbabilityBuffer!!)
 
-            return InferenceResult(topPredictions, time)
+            val resultString = labeledProbability.entries.joinToString(separator = "\n") { 
+                "${it.key} : ${(it.value * 100).toInt()}%" 
+            }
+
+            return Pair(resultString, inferenceTime)
         }
     }
 
-    private fun softmax(logits: FloatArray): FloatArray {
-        val maxLogit = logits.maxOrNull() ?: 0f
-        val expValues = logits.map { exp((it - maxLogit).toDouble()).toFloat() }
-        val sumExp = expValues.sum()
-        return expValues.map { it / sumExp }.toFloatArray()
+    object ImageUtils {
+        // NHWC(Bitmap) -> NCHW(Model Input) 변환 (Float)
+        fun permuteNHWCToNCHW_Float(src: ByteBuffer, height: Int, width: Int, dst: ByteBuffer) {
+            // src: [H, W, 3]
+            // dst: [3, H, W]
+            val totalPixels = height * width
+            src.rewind()
+            val srcFloat = src.asFloatBuffer()
+            val dstFloat = dst.asFloatBuffer()
+            
+            val rBase = 0
+            val gBase = totalPixels
+            val bBase = totalPixels * 2
+            
+            for (i in 0 until totalPixels) {
+                val r = srcFloat.get(i * 3 + 0)
+                val g = srcFloat.get(i * 3 + 1)
+                val b = srcFloat.get(i * 3 + 2)
+                
+                dstFloat.put(rBase + i, r)
+                dstFloat.put(gBase + i, g)
+                dstFloat.put(bBase + i, b)
+            }
+        }
+        
+        // NHWC(Bitmap) -> NCHW(Model Input) 변환 (Uint8)
+        fun permuteNHWCToNCHW_Uint8(src: ByteBuffer, height: Int, width: Int, dst: ByteBuffer) {
+            val totalPixels = height * width
+            src.rewind()
+            val rBase = 0
+            val gBase = totalPixels
+            val bBase = totalPixels * 2
+            
+            for (i in 0 until totalPixels) {
+                val r = src.get(i * 3 + 0)
+                val g = src.get(i * 3 + 1)
+                val b = src.get(i * 3 + 2)
+                
+                dst.put(rBase + i, r)
+                dst.put(gBase + i, g)
+                dst.put(bBase + i, b)
+            }
+        }
+    }
+    
+    private fun getTopKLabels(tensorBuffer: TensorBuffer): Map<String, Float> {
+        val probabilities = tensorBuffer.floatArray
+        // 확률 분포로 변환 (필요 시 Softmax)
+        val softmaxProb = softmax(probabilities)
+        
+        val maxIndex = softmaxProb.indices.maxByOrNull { softmaxProb[it] } ?: -1
+        if (maxIndex == -1) return emptyMap()
+        
+        // 라벨 로드 (실제 앱에서는 파일에서 한 번만 읽도록 최적화 권장)
+        val labels = try {
+            FileUtil.loadLabels(context, "labels.txt")
+        } catch (e: Exception) {
+            return mapOf("Unknown" to softmaxProb[maxIndex])
+        }
+        
+        val topK = softmaxProb.mapIndexed { index, fl -> index to fl }
+            .sortedByDescending { it.second }
+            .take(3)
+            
+        val result = mutableMapOf<String, Float>()
+        val outputSize = probabilities.size
+        
+        for ((index, prob) in topK) {
+            var label = "Unknown($index)"
+            if (labels.size == 1000 && outputSize == 1001) {
+                // ImageNet 1001 class model with 1000 labels (Index 0 is background)
+                if (index > 0 && index - 1 < labels.size) {
+                    label = labels[index - 1]
+                } else if (index == 0) {
+                    label = "Background"
+                }
+            } else {
+                // Standard mapping
+                if (index < labels.size) {
+                    label = labels[index]
+                }
+            }
+            result[label] = prob
+        }
+        return result
+    }
+    
+    // Softmax 함수 구현
+    private fun softmax(input: FloatArray): FloatArray {
+        val output = FloatArray(input.size)
+        var sum = 0.0f
+        val max = input.maxOrNull() ?: 0.0f
+        
+        for (i in input.indices) {
+            output[i] = kotlin.math.exp(input[i] - max)
+            sum += output[i]
+        }
+        
+        if (sum != 0.0f) {
+            for (i in output.indices) {
+                output[i] /= sum
+            }
+        }
+        return output
     }
 
     fun close() {
         synchronized(lock) {
-            modelWrapper.close()
+            interpreter?.close()
+            interpreter = null
+            gpuDelegate?.close()
+            gpuDelegate = null
+            nnApiDelegate?.close()
+            nnApiDelegate = null
+        }
+    }
+    
+    fun setHardwareAccel(accel: HardwareAccel) {
+        if (currentAccel != accel) {
+            initialize(currentModelName, accel)
+        }
+    }
+    
+    fun setModel(modelName: String) {
+        if (currentModelName != modelName) {
+            initialize(modelName, currentAccel)
         }
     }
 }

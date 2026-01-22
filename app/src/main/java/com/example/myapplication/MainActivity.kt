@@ -61,8 +61,8 @@ class MainActivity : ComponentActivity() {
 fun MainScreen() {
     val context = LocalContext.current
     var selectedModel by remember { mutableStateOf("mobilenet_v2.tflite") }
-    // "Interpreter" vs "CompiledModel"
-    var selectedRuntime by remember { mutableStateOf(ImageClassifier.Runtime.INTERPRETER) }
+    // "Hardware Acceleration"
+    var selectedAccel by remember { mutableStateOf(ImageClassifier.HardwareAccel.CPU) }
     
     var hasCameraPermission by remember {
         mutableStateOf(
@@ -93,7 +93,7 @@ fun MainScreen() {
                         Text("Camera", modifier = Modifier.padding(16.dp))
                     }
                 }
-                // Model & Runtime Selector
+                // Model & Hardware Accel Selector
                 Column(
                     modifier = Modifier.fillMaxWidth().padding(8.dp),
                     horizontalAlignment = Alignment.CenterHorizontally
@@ -118,30 +118,33 @@ fun MainScreen() {
                         Text("INT8", style = MaterialTheme.typography.bodySmall)
                     }
                     
-                    // Runtime Row
+                    // Hardware Acceleration Row
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.Center,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Text("Runtime: ", style = MaterialTheme.typography.labelMedium)
+                        Text("Accel: ", style = MaterialTheme.typography.labelMedium)
+                        
                         RadioButton(
-                            selected = selectedRuntime == ImageClassifier.Runtime.INTERPRETER,
-                            onClick = { selectedRuntime = ImageClassifier.Runtime.INTERPRETER }
+                            selected = selectedAccel == ImageClassifier.HardwareAccel.CPU,
+                            onClick = { selectedAccel = ImageClassifier.HardwareAccel.CPU }
                         )
-                        Text("Interpreter", style = MaterialTheme.typography.bodySmall)
+                        Text("CPU", style = MaterialTheme.typography.bodySmall)
                         Spacer(modifier = Modifier.width(8.dp))
+                        
                         RadioButton(
-                            selected = selectedRuntime == ImageClassifier.Runtime.PLAY_SERVICES,
-                            onClick = { selectedRuntime = ImageClassifier.Runtime.PLAY_SERVICES }
+                            selected = selectedAccel == ImageClassifier.HardwareAccel.GPU,
+                            onClick = { selectedAccel = ImageClassifier.HardwareAccel.GPU }
                         )
-                        Text("PlaySvc", style = MaterialTheme.typography.bodySmall)
+                        Text("GPU", style = MaterialTheme.typography.bodySmall)
                         Spacer(modifier = Modifier.width(8.dp))
+                        
                         RadioButton(
-                            selected = selectedRuntime == ImageClassifier.Runtime.COMPILED_MODEL,
-                            onClick = { selectedRuntime = ImageClassifier.Runtime.COMPILED_MODEL }
+                            selected = selectedAccel == ImageClassifier.HardwareAccel.NPU,
+                            onClick = { selectedAccel = ImageClassifier.HardwareAccel.NPU }
                         )
-                        Text("LiteRT", style = MaterialTheme.typography.bodySmall)
+                        Text("NPU", style = MaterialTheme.typography.bodySmall)
                     }
                 }
             }
@@ -150,8 +153,8 @@ fun MainScreen() {
         Box(modifier = Modifier.padding(innerPadding).fillMaxSize()) {
             if (hasCameraPermission) {
                 when (mode) {
-                    AppMode.GALLERY -> GalleryInferenceScreen(selectedModel, selectedRuntime)
-                    AppMode.CAMERA -> CameraInferenceScreen(selectedModel, selectedRuntime)
+                    AppMode.GALLERY -> GalleryInferenceScreen(selectedModel, selectedAccel)
+                    AppMode.CAMERA -> CameraInferenceScreen(selectedModel, selectedAccel)
                 }
             } else {
                 Text("Camera permission required", modifier = Modifier.align(Alignment.Center))
@@ -163,21 +166,21 @@ fun MainScreen() {
 enum class AppMode { GALLERY, CAMERA }
 
 @Composable
-fun GalleryInferenceScreen(modelName: String, runtime: ImageClassifier.Runtime) {
+fun GalleryInferenceScreen(modelName: String, accel: ImageClassifier.HardwareAccel) {
     val context = LocalContext.current
     var selectedImageUri by remember { mutableStateOf<Uri?>(null) }
     var resultBitmap by remember { mutableStateOf<Bitmap?>(null) }
-    var results by remember { mutableStateOf<List<Pair<String, Float>>>(emptyList()) }
+    var resultString by remember { mutableStateOf("") }
     var inferenceTime by remember { mutableStateOf(0L) }
     
     val classifier = remember { ImageClassifier(context) }
     
-    // Update model when selection changes (Model OR Runtime)
+    // Update model when selection changes (Model OR Accel)
     LaunchedEffect(modelName) {
         classifier.setModel(modelName)
     }
-    LaunchedEffect(runtime) {
-        classifier.setRuntime(runtime)
+    LaunchedEffect(accel) {
+        classifier.setHardwareAccel(accel)
     }
 
     val pickerLauncher = rememberLauncherForActivityResult(
@@ -188,8 +191,8 @@ fun GalleryInferenceScreen(modelName: String, runtime: ImageClassifier.Runtime) 
                 val bitmap = MediaStore.Images.Media.getBitmap(context.contentResolver, it)
                 resultBitmap = bitmap
                 val res = classifier.classify(bitmap)
-                results = res.predictions
-                inferenceTime = res.inferenceTime
+                resultString = res.first
+                inferenceTime = res.second
             }
         }
     )
@@ -214,25 +217,33 @@ fun GalleryInferenceScreen(modelName: String, runtime: ImageClassifier.Runtime) 
 
         Spacer(modifier = Modifier.height(16.dp))
 
-        ResultsList(results, inferenceTime)
+        ResultsList(resultString, inferenceTime)
     }
 }
 
 @Composable
-fun CameraInferenceScreen(modelName: String, runtime: ImageClassifier.Runtime) {
+fun CameraInferenceScreen(modelName: String, accel: ImageClassifier.HardwareAccel) {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
-    var results by remember { mutableStateOf<List<Pair<String, Float>>>(emptyList()) }
+    var resultString by remember { mutableStateOf("") }
     var inferenceTime by remember { mutableStateOf(0L) }
+    var averageTime by remember { mutableStateOf(0L) }
+    
+    // Thread-safe history buffer: (Timestamp, Duration)
+    val inferenceHistory = remember { java.util.Collections.synchronizedList(java.util.ArrayList<Pair<Long, Long>>()) }
     
     val classifier = remember { ImageClassifier(context) }
     
     // Update model when selection changes
     LaunchedEffect(modelName) {
         classifier.setModel(modelName)
+        inferenceHistory.clear()
+        averageTime = 0L
     }
-    LaunchedEffect(runtime) {
-        classifier.setRuntime(runtime)
+    LaunchedEffect(accel) {
+        classifier.setHardwareAccel(accel)
+        inferenceHistory.clear()
+        averageTime = 0L
     }
 
     val cameraExecutor = remember { Executors.newSingleThreadExecutor() }
@@ -258,8 +269,21 @@ fun CameraInferenceScreen(modelName: String, runtime: ImageClassifier.Runtime) {
                                 val bitmap = imageProxy.toBitmap()
                                 if (bitmap != null) {
                                     val res = classifier.classify(bitmap)
-                                    results = res.predictions
-                                    inferenceTime = res.inferenceTime
+                                    val currentDuration = res.second
+                                    resultString = res.first
+                                    inferenceTime = currentDuration
+                                    
+                                    // 10s Moving Average Logic
+                                    val now = System.currentTimeMillis()
+                                    synchronized(inferenceHistory) {
+                                        inferenceHistory.add(Pair(now, currentDuration))
+                                        // Remove entries older than 10 seconds (10000 ms)
+                                        val cutoff = now - 10000
+                                        inferenceHistory.removeIf { it.first < cutoff }
+                                        
+                                        val sum = inferenceHistory.sumOf { it.second }
+                                        averageTime = if (inferenceHistory.isNotEmpty()) sum / inferenceHistory.size else 0L
+                                    }
                                 }
                                 imageProxy.close()
                             }
@@ -285,29 +309,34 @@ fun CameraInferenceScreen(modelName: String, runtime: ImageClassifier.Runtime) {
             color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.8f),
             modifier = Modifier.align(Alignment.BottomCenter).fillMaxWidth().padding(16.dp)
         ) {
-            ResultsList(results, inferenceTime)
+            ResultsList(resultString, inferenceTime, averageTime)
         }
     }
 }
 
 @Composable
-fun ResultsList(results: List<Pair<String, Float>>, inferenceTime: Long) {
+fun ResultsList(resultString: String, inferenceTime: Long, averageTime: Long = 0L) {
     LazyColumn(modifier = Modifier.padding(16.dp)) {
         item {
-            Text(
-                text = "Inference Time: ${inferenceTime}ms",
-                style = MaterialTheme.typography.labelLarge,
-                modifier = Modifier.padding(bottom = 8.dp)
-            )
-        }
-        items(results) { result ->
-            Row(
-                modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
-                horizontalArrangement = Arrangement.SpaceBetween
-            ) {
-                Text(text = result.first, style = MaterialTheme.typography.bodyLarge)
-                Text(text = "%.2f%%".format(result.second * 100), style = MaterialTheme.typography.bodyLarge)
+            Row(modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp), horizontalArrangement = Arrangement.SpaceBetween) {
+                Text(
+                    text = "Time: ${inferenceTime}ms",
+                    style = MaterialTheme.typography.labelLarge,
+                )
+                if (averageTime > 0) {
+                    Text(
+                        text = "Avg(10s): ${averageTime}ms",
+                        style = MaterialTheme.typography.labelLarge,
+                        color = MaterialTheme.colorScheme.primary
+                    )
+                }
             }
+        }
+        item {
+            Text(
+                text = resultString,
+                style = MaterialTheme.typography.bodyLarge
+            )
         }
     }
 }
