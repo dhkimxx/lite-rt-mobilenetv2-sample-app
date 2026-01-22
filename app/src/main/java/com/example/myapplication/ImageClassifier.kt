@@ -2,6 +2,7 @@ package com.example.myapplication
 
 import android.content.Context
 import android.graphics.Bitmap
+import android.util.Log
 import org.tensorflow.lite.DataType
 import org.tensorflow.lite.Interpreter
 import org.tensorflow.lite.gpu.CompatibilityList
@@ -22,29 +23,33 @@ class ImageClassifier(private val context: Context) {
         CPU, GPU, NPU
     }
 
+    private val TAG = "ImageClassifier"
     private val lock = Any()
-
-    init {
-        initialize()
-    }
 
     private var interpreter: Interpreter? = null
     private var inputImageBuffer: TensorImage? = null
     private var outputProbabilityBuffer: TensorBuffer? = null
     
-    // 캐시된 모델 정보
     private var cachedInputShape: IntArray = intArrayOf(1, 224, 224, 3)
     private var cachedOutputShape: IntArray = intArrayOf(1, 1001)
     private var inputDataType: DataType = DataType.FLOAT32
     private var outputDataType: DataType = DataType.FLOAT32
+    private var outputQuantParams: org.tensorflow.lite.Tensor.QuantizationParams? = null
     
-    // Delegate 참조 (닫기 위해 필요)
+    private var inputScale: Float = 1.0f
+    private var inputZeroPoint: Int = 0
+
     private var gpuDelegate: GpuDelegate? = null
     private var nnApiDelegate: NnApiDelegate? = null
     
-    // 현재 설정
     private var currentModelName: String = "mobilenet_v2.tflite"
     private var currentAccel: HardwareAccel = HardwareAccel.CPU
+    private var isNCHW: Boolean = false
+    private var inputBuffer: ByteBuffer? = null
+
+    init {
+        initialize()
+    }
 
     fun initialize(modelName: String = "mobilenet_v2.tflite", accel: HardwareAccel = HardwareAccel.CPU) {
         synchronized(lock) {
@@ -54,11 +59,9 @@ class ImageClassifier(private val context: Context) {
         }
     }
 
-    private var isNCHW: Boolean = false
-    private var inputBuffer: ByteBuffer? = null
-
     private fun loadModel() {
-        close() // Internal close, safe because initialize holds lock
+        Log.i(TAG, "Loading $currentModelName with $currentAccel")
+        close()
         try {
             val modelBuffer = FileUtil.loadMappedFile(context, currentModelName)
             val options = Interpreter.Options()
@@ -68,218 +71,184 @@ class ImageClassifier(private val context: Context) {
                     if (CompatibilityList().isDelegateSupportedOnThisDevice) {
                         gpuDelegate = GpuDelegate()
                         options.addDelegate(gpuDelegate)
-                        android.util.Log.d("ImageClassifier", "Initialized GPU Delegate")
-                    } else {
-                        android.util.Log.w("ImageClassifier", "GPU Delegate not supported on this device. Falling back to CPU.")
                     }
                 }
                 HardwareAccel.NPU -> {
                     nnApiDelegate = NnApiDelegate()
                     options.addDelegate(nnApiDelegate)
-                    android.util.Log.d("ImageClassifier", "Initialized NNApi Delegate")
                 }
                 HardwareAccel.CPU -> {
-                    options.setUseXNNPACK(true) // XNNPACK은 CPU 가속을 위해 기본적으로 활성화 권장
-                    android.util.Log.d("ImageClassifier", "Initialized CPU (XNNPACK)")
+                    options.setUseXNNPACK(true)
                 }
             }
-            interpreter = Interpreter(modelBuffer, options)
             
-            // 텐서 정보 읽기
-            val inputTensor = interpreter!!.getInputTensor(0)
-            val outputTensor = interpreter!!.getOutputTensor(0)
+            val newInterpreter = Interpreter(modelBuffer, options)
+            val inputTensor = newInterpreter.getInputTensor(0)
+            val outputTensor = newInterpreter.getOutputTensor(0)
             
             cachedInputShape = inputTensor.shape()
             cachedOutputShape = outputTensor.shape()
             inputDataType = inputTensor.dataType()
             outputDataType = outputTensor.dataType()
             
-            // NCHW 감지 ( [1, 3, H, W] )
-            isNCHW = cachedInputShape.size == 4 && cachedInputShape[1] == 3
-            
-            if (isNCHW && currentAccel != HardwareAccel.CPU) {
-                // Warning: NCHW on GPU/NPU might be unstable.
-                android.util.Log.w("ImageClassifier", "NCHW model detected with GPU/NPU. If crash occurs, please switch to CPU.")
+            if (inputDataType != DataType.FLOAT32) {
+                val qp = inputTensor.quantizationParams()
+                inputScale = qp.scale
+                inputZeroPoint = qp.zeroPoint
+                Log.d(TAG, "Input QuantParams: S=$inputScale, ZP=$inputZeroPoint")
             }
 
-            android.util.Log.d("ImageClassifier", "Model loaded: $currentModelName, Input: $inputDataType, Shape: ${cachedInputShape.contentToString()}, NCHW: $isNCHW")
+            if (outputDataType != DataType.FLOAT32) {
+                try {
+                    outputQuantParams = outputTensor.quantizationParams()
+                    Log.d(TAG, "Output QuantParams: S=${outputQuantParams?.scale}, ZP=${outputQuantParams?.zeroPoint}")
+                } catch (e: Exception) {
+                    outputQuantParams = null
+                }
+            }
             
-            // 버퍼 초기화
-            // TensorImage는 NHWC를 다루지만, NCHW 변환을 위한 별도 ByteBuffer가 필요할 수 있음
+            isNCHW = cachedInputShape.size == 4 && cachedInputShape[1] == 3
+            Log.i(TAG, "Model Ready: $currentModelName, isNCHW=$isNCHW, Input=$inputDataType")
+            
             inputImageBuffer = TensorImage(inputDataType)
             outputProbabilityBuffer = TensorBuffer.createFixedSize(cachedOutputShape, outputDataType)
             
-            if (isNCHW) {
-                val inputSize = cachedInputShape.reduce { acc, i -> acc * i }
-                val bytesPerElement = if (inputDataType == DataType.FLOAT32) 4 else 1
-                inputBuffer = ByteBuffer.allocateDirect(inputSize * bytesPerElement).order(ByteOrder.nativeOrder())
-            }
+            val totalElements = cachedInputShape.reduce { acc, i -> acc * i }
+            val bytesPerElement = if (inputDataType == DataType.FLOAT32) 4 else 1
+            inputBuffer = ByteBuffer.allocateDirect(totalElements * bytesPerElement).order(ByteOrder.nativeOrder())
+            
+            interpreter = newInterpreter
             
         } catch (e: Exception) {
-            android.util.Log.e("ImageClassifier", "Error loading model: ${e.message}")
-            e.printStackTrace()
+            Log.e(TAG, "Load failed: ${e.message}", e)
         }
     }
 
     fun classify(bitmap: Bitmap): Pair<String, Long> {
         synchronized(lock) {
-            if (interpreter == null) return Pair("Error: Model not loaded", 0)
-
+            val currentInterpreter = interpreter ?: return "Error: Init Fail" to 0
             val startTime = android.os.SystemClock.uptimeMillis()
 
-            // 1. 이미지 전처리 (입력 Shape에 맞게 Resize)
-            val height = if (isNCHW) cachedInputShape[2] else cachedInputShape[1]
-            val width = if (isNCHW) cachedInputShape[3] else cachedInputShape[2]
-
-            val imageProcessor = ImageProcessor.Builder()
-                .add(ResizeOp(height, width, ResizeOp.ResizeMethod.BILINEAR))
-                .add(NormalizeOp(127.5f, 127.5f)) // [0, 255] -> [-1, 1]
-                .build()
-
-            inputImageBuffer!!.load(bitmap)
-            val processedImage = imageProcessor.process(inputImageBuffer)
-
-            // 2. 추론
             try {
+                val h = if (isNCHW) cachedInputShape[2] else cachedInputShape[1]
+                val w = if (isNCHW) cachedInputShape[3] else cachedInputShape[2]
+                
+                val resizedBitmap = Bitmap.createScaledBitmap(bitmap, w, h, true)
+                val pixels = IntArray(w * h)
+                resizedBitmap.getPixels(pixels, 0, w, 0, 0, w, h)
+
+                inputBuffer!!.rewind()
+                val isF32 = inputDataType == DataType.FLOAT32
+                val total = w * h
+
                 if (isNCHW) {
-                    // NHWC -> NCHW 변환
-                    if (inputBuffer == null) throw IllegalStateException("Input buffer not initialized for NCHW")
-                    inputBuffer!!.rewind()
-
-                    if (inputDataType == DataType.FLOAT32) {
-                        ImageUtils.permuteNHWCToNCHW_Float(processedImage.buffer, height, width, inputBuffer!!)
+                    if (isF32) {
+                        val fb = inputBuffer!!.asFloatBuffer()
+                        for (i in 0 until total) {
+                            val p = pixels[i]
+                            // R G B
+                            fb.put(0 * total + i, (((p shr 16) and 0xFF) - 127.5f) / 127.5f)
+                            fb.put(1 * total + i, (((p shr 8) and 0xFF) - 127.5f) / 127.5f)
+                            fb.put(2 * total + i, ((p and 0xFF) - 127.5f) / 127.5f)
+                        }
                     } else {
-                        ImageUtils.permuteNHWCToNCHW_Uint8(processedImage.buffer, height, width, inputBuffer!!)
+                        // UINT8 NCHW - Try B-G-R for INT8
+                        for (i in 0 until total) {
+                            val p = pixels[i]
+                            val r = ((p shr 16) and 0xFF).toByte()
+                            val g = ((p shr 8) and 0xFF).toByte()
+                            val b = (p and 0xFF).toByte()
+                            
+                            // Swap R <-> B
+                            inputBuffer!!.put(0 * total + i, b) // Blue first
+                            inputBuffer!!.put(1 * total + i, g)
+                            inputBuffer!!.put(2 * total + i, r) // Red last
+                        }
                     }
-
-                    inputBuffer!!.rewind()
-                    interpreter!!.run(inputBuffer, outputProbabilityBuffer!!.buffer.rewind())
                 } else {
-                    // NHWC 그대로 전달
-                    interpreter!!.run(processedImage.buffer, outputProbabilityBuffer!!.buffer.rewind())
+                    if (isF32) {
+                        val fb = inputBuffer!!.asFloatBuffer()
+                        for (p in pixels) {
+                            fb.put((((p shr 16) and 0xFF) - 127.5f) / 127.5f)
+                            fb.put((((p shr 8) and 0xFF) - 127.5f) / 127.5f)
+                            fb.put(((p and 0xFF) - 127.5f) / 127.5f)
+                        }
+                    } else {
+                        for (p in pixels) {
+                            inputBuffer!!.put(((p shr 16) and 0xFF).toByte())
+                            inputBuffer!!.put(((p shr 8) and 0xFF).toByte())
+                            inputBuffer!!.put((p and 0xFF).toByte())
+                        }
+                    }
                 }
+
+                inputBuffer!!.rewind()
+                currentInterpreter.run(inputBuffer, outputProbabilityBuffer!!.buffer.rewind())
+
+                val labeledProb = getTopKLabels(outputProbabilityBuffer!!)
+                val top1 = labeledProb.entries.firstOrNull()
+                Log.i(TAG, "Prediction: ${top1?.key} (${(top1?.value ?: 0f) * 100}%)")
+                
+                val cost = android.os.SystemClock.uptimeMillis() - startTime
+                
+                val result = labeledProb.entries.joinToString("\n") { 
+                    "${it.key} : ${(it.value * 100).toInt()}%" 
+                }
+                return result to cost
+
             } catch (e: Exception) {
-                android.util.Log.e("ImageClassifier", "Inference failed: ${e.message}")
-                return Pair("Error: Inference failed", 0)
-            }
-
-            val inferenceTime = android.os.SystemClock.uptimeMillis() - startTime
-
-            // 3. 결과 후처리
-            val labeledProbability = getTopKLabels(outputProbabilityBuffer!!)
-
-            val resultString = labeledProbability.entries.joinToString(separator = "\n") { 
-                "${it.key} : ${(it.value * 100).toInt()}%" 
-            }
-
-            return Pair(resultString, inferenceTime)
-        }
-    }
-
-    object ImageUtils {
-        // NHWC(Bitmap) -> NCHW(Model Input) 변환 (Float)
-        fun permuteNHWCToNCHW_Float(src: ByteBuffer, height: Int, width: Int, dst: ByteBuffer) {
-            // src: [H, W, 3]
-            // dst: [3, H, W]
-            val totalPixels = height * width
-            src.rewind()
-            val srcFloat = src.asFloatBuffer()
-            val dstFloat = dst.asFloatBuffer()
-            
-            val rBase = 0
-            val gBase = totalPixels
-            val bBase = totalPixels * 2
-            
-            for (i in 0 until totalPixels) {
-                val r = srcFloat.get(i * 3 + 0)
-                val g = srcFloat.get(i * 3 + 1)
-                val b = srcFloat.get(i * 3 + 2)
-                
-                dstFloat.put(rBase + i, r)
-                dstFloat.put(gBase + i, g)
-                dstFloat.put(bBase + i, b)
-            }
-        }
-        
-        // NHWC(Bitmap) -> NCHW(Model Input) 변환 (Uint8)
-        fun permuteNHWCToNCHW_Uint8(src: ByteBuffer, height: Int, width: Int, dst: ByteBuffer) {
-            val totalPixels = height * width
-            src.rewind()
-            val rBase = 0
-            val gBase = totalPixels
-            val bBase = totalPixels * 2
-            
-            for (i in 0 until totalPixels) {
-                val r = src.get(i * 3 + 0)
-                val g = src.get(i * 3 + 1)
-                val b = src.get(i * 3 + 2)
-                
-                dst.put(rBase + i, r)
-                dst.put(gBase + i, g)
-                dst.put(bBase + i, b)
+                Log.e(TAG, "Classify fail: ${e.message}", e)
+                return "Error: ${e.message}" to 0
             }
         }
     }
-    
+
     private fun getTopKLabels(tensorBuffer: TensorBuffer): Map<String, Float> {
-        val probabilities = tensorBuffer.floatArray
-        // 확률 분포로 변환 (필요 시 Softmax)
-        val softmaxProb = softmax(probabilities)
+        val raw = tensorBuffer.floatArray
         
-        val maxIndex = softmaxProb.indices.maxByOrNull { softmaxProb[it] } ?: -1
-        if (maxIndex == -1) return emptyMap()
-        
-        // 라벨 로드 (실제 앱에서는 파일에서 한 번만 읽도록 최적화 권장)
+        // Diagnostic Log for INT8 saturation
+        if (outputDataType != DataType.FLOAT32) {
+             val rawInt = IntArray(raw.size) { raw[it].toInt() and 0xFF }
+             val sorted = rawInt.mapIndexed { i, v -> i to v }.sortedByDescending { it.second }.take(5)
+             Log.v(TAG, "INT8 raw distribution (top 5 indices/values): $sorted")
+        }
+
+        val dequantized = if (outputDataType == DataType.FLOAT32) {
+            raw
+        } else {
+            val scale = outputQuantParams?.scale ?: 1.0f
+            val zp = outputQuantParams?.zeroPoint ?: 0
+            FloatArray(raw.size) { (raw[it] - zp) * scale }
+        }
+
+        val probs = softmax(dequantized)
+
         val labels = try {
             FileUtil.loadLabels(context, "labels.txt")
         } catch (e: Exception) {
-            return mapOf("Unknown" to softmaxProb[maxIndex])
+            return mapOf("Error labels" to 0f)
         }
-        
-        val topK = softmaxProb.mapIndexed { index, fl -> index to fl }
+
+        return probs.mapIndexed { i, p -> i to p }
             .sortedByDescending { it.second }
             .take(3)
-            
-        val result = mutableMapOf<String, Float>()
-        val outputSize = probabilities.size
-        
-        for ((index, prob) in topK) {
-            var label = "Unknown($index)"
-            if (labels.size == 1000 && outputSize == 1001) {
-                // ImageNet 1001 class model with 1000 labels (Index 0 is background)
-                if (index > 0 && index - 1 < labels.size) {
-                    label = labels[index - 1]
-                } else if (index == 0) {
-                    label = "Background"
+            .associate { (idx, p) ->
+                val label = if (labels.size == 1000 && raw.size == 1001) {
+                    if (idx == 0) "Background" else if (idx - 1 < labels.size) labels[idx - 1] else "Unknown($idx)"
+                } else if (idx < labels.size) {
+                    labels[idx]
+                } else {
+                    "Class $idx"
                 }
-            } else {
-                // Standard mapping
-                if (index < labels.size) {
-                    label = labels[index]
-                }
+                label to p
             }
-            result[label] = prob
-        }
-        return result
     }
-    
-    // Softmax 함수 구현
+
     private fun softmax(input: FloatArray): FloatArray {
-        val output = FloatArray(input.size)
-        var sum = 0.0f
         val max = input.maxOrNull() ?: 0.0f
-        
-        for (i in input.indices) {
-            output[i] = kotlin.math.exp(input[i] - max)
-            sum += output[i]
-        }
-        
-        if (sum != 0.0f) {
-            for (i in output.indices) {
-                output[i] /= sum
-            }
-        }
-        return output
+        val exp = FloatArray(input.size) { kotlin.math.exp(input[it] - max).coerceAtLeast(0f) }
+        val sum = exp.sum()
+        return if (sum > 0.0f) FloatArray(input.size) { exp[it] / sum } else input
     }
 
     fun close() {
@@ -292,16 +261,7 @@ class ImageClassifier(private val context: Context) {
             nnApiDelegate = null
         }
     }
-    
-    fun setHardwareAccel(accel: HardwareAccel) {
-        if (currentAccel != accel) {
-            initialize(currentModelName, accel)
-        }
-    }
-    
-    fun setModel(modelName: String) {
-        if (currentModelName != modelName) {
-            initialize(modelName, currentAccel)
-        }
-    }
+
+    fun setHardwareAccel(accel: HardwareAccel) = initialize(currentModelName, accel)
+    fun setModel(modelName: String) = initialize(modelName, currentAccel)
 }
